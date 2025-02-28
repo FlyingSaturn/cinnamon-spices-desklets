@@ -1,21 +1,21 @@
-const Applet = imports.ui.applet;
-const Util = imports.misc.util;
+const Desklet = imports.ui.desklet;
+const St = imports.gi.St;
 
-function MyApplet(orientation, panel_height, instance_id) {
-    this._init(orientation, panel_height, instance_id);
+function MyDesklet(metadata, instance_id) {
+    this._init(metadata, instance_id);
 }
 
-MyApplet.prototype = {
-    __proto__: Applet.IconApplet.prototype,
+function main(metadata, instance_id) {
+    return new MyDesklet(metadata, instance_id);
+}
 
-    _init: function(orientation, panel_height, instance_id) {
+MyDesklet.prototype = {
+    __proto__: Desklet.Desklet.prototype,
+
+    _init: function(metadata, instance_id) {
     },
 
-    on_applet_clicked: function(){
-    }
-
+   
 };
 
-function main(metadata, orientation, panel_height, instance_id) {
-    return new MyApplet(orientation, panel_height, instance_id);
-}
+
