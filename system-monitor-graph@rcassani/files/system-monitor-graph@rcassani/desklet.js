@@ -106,7 +106,7 @@ SystemMonitorGraph.prototype = {
             this.ram_values  = new Array(2).fill(0.0);
             this.swap_values = new Array(2).fill(0.0);
             this.hdd_values  = new Array(4).fill(0.0);
-            this.gpu_use     = 0;
+            this.gpu_use     = NaN;
             this.gpu_mem     = new Array(2).fill(0.0);
 
             // set colors
@@ -223,39 +223,45 @@ SystemMonitorGraph.prototype = {
               break;
 
           case "gpu":
-              switch (this.gpu_manufacturer) {
-                case "nvidia":
-                    switch (this.gpu_variable) {
-                        case "usage":
-                            this.get_nvidia_gpu_use();
-                            value = this.gpu_use / 100;
-                            text1 = _("GPU Usage");
-                            text2 = Math.round(this.gpu_use).toString() + "%";
-                            break;
-                        case "memory":
-                            this.get_nvidia_gpu_mem();
-                            let gpu_mem_use = 100 * this.gpu_mem[1] / this.gpu_mem[0];
-                            value = gpu_mem_use / 100;
-                            let gpumem_prefix = "";
-                            if (this.data_prefix_gpumem == 1) {
-                                // decimal prefix
-                                gpumem_prefix =  _("GB");
-                            } else {
-                                // binary prefix
-                                gpumem_prefix =  _("GiB");
-                            }
-                            text1 = _("GPU Memory");
-                            text2 = Math.round(gpu_mem_use).toString() + "%"
-                            text3 = this.gpu_mem[1].toFixed(1) + " / "
-                                  + this.gpu_mem[0].toFixed(1) + " " + gpumem_prefix;
-                            break;
-                    }
-                    break;
-
-                case "other":
-                    break
+              switch (this.gpu_variable) {
+                  case "usage":
+                      switch (this.gpu_manufacturer) {
+                          case "nvidia":
+                              this.get_nvidia_gpu_use();
+                              break;
+                          case "amdgpu":
+                              this.get_amdgpu_gpu_use();
+                              break;
+                      }
+                      value = this.gpu_use / 100;
+                      text1 = _("GPU Usage");
+                      text2 = Math.round(this.gpu_use).toString() + "%";
+                      break;
+                  case "memory":
+                      switch (this.gpu_manufacturer) {
+                          case "nvidia":
+                              this.get_nvidia_gpu_mem();
+                              break;
+                          case "amdgpu":
+                              this.get_amdgpu_gpu_mem();
+                              break;
+                      }
+                      let gpu_mem_use = 100 * this.gpu_mem[1] / this.gpu_mem[0];
+                      value = gpu_mem_use / 100;
+                      let gpumem_prefix = "";
+                      if (this.data_prefix_gpumem == 1) {
+                          // decimal prefix
+                          gpumem_prefix =  _("GB");
+                      } else {
+                          // binary prefix
+                          gpumem_prefix =  _("GiB");
+                      }
+                      text1 = _("GPU Memory");
+                      text2 = Math.round(gpu_mem_use).toString() + "%"
+                      text3 = this.gpu_mem[1].toFixed(1) + " / "
+                            + this.gpu_mem[0].toFixed(1) + " " + gpumem_prefix;
+                      break;
               }
-              break;
         }
 
         // concatenate new value
@@ -508,10 +514,15 @@ SystemMonitorGraph.prototype = {
     },
 
     get_nvidia_gpu_use: function() {
-        let subprocess = Gio.Subprocess.new(
-            ['/usr/bin/nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv', '--id='+ this.gpu_id],
-            Gio.SubprocessFlags.STDOUT_PIPE|Gio.SubprocessFlags.STDERR_PIPE
-        );
+        let subprocess
+        try {
+            subprocess = Gio.Subprocess.new(
+                ['/usr/bin/nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv', '--id='+ this.gpu_id],
+                Gio.SubprocessFlags.STDOUT_PIPE|Gio.SubprocessFlags.STDERR_PIPE
+            );
+        } catch (err) {
+            return;
+        }
         subprocess.communicate_utf8_async(null, null, (subprocess, result) => {
             let [, stdout, stderr] = subprocess.communicate_utf8_finish(result);
             this.gpu_use =  parseInt(stdout.match(/[^\r\n]+/g)[1]); // parse integer in second line
@@ -519,10 +530,15 @@ SystemMonitorGraph.prototype = {
     },
 
     get_nvidia_gpu_mem: function() {
-        let subprocess = Gio.Subprocess.new(
-            ['/usr/bin/nvidia-smi', '--query-gpu=memory.total,memory.used', '--format=csv', '--id='+ this.gpu_id],
-            Gio.SubprocessFlags.STDOUT_PIPE|Gio.SubprocessFlags.STDERR_PIPE
-        );
+        let subprocess
+        try {
+            subprocess = Gio.Subprocess.new(
+                ['/usr/bin/nvidia-smi', '--query-gpu=memory.total,memory.used', '--format=csv', '--id='+ this.gpu_id],
+                Gio.SubprocessFlags.STDOUT_PIPE|Gio.SubprocessFlags.STDERR_PIPE
+            );
+        } catch {
+            return;
+        }
         subprocess.communicate_utf8_async(null, null, (subprocess, result) => {
             let [, stdout, stderr] = subprocess.communicate_utf8_finish(result);
             let fslines = stdout.split(/\r?\n/); // Line0:Headers Line1:Values
@@ -541,6 +557,54 @@ SystemMonitorGraph.prototype = {
             this.gpu_mem[0] = mem_tot;
             this.gpu_mem[1] = mem_usd;
         });
+    },
+
+    get_amdgpu_gpu_use: function() {
+      // Sysfs directory with files related to the chosen gpu
+      let gpu_dir = "/sys/class/drm/card" + this.gpu_id + "/device/";
+
+      // File gpu_busy_percent contains the percentage of time that the gpu is busy
+      // expresed as an integer number from 0 to 100
+      Gio.File.new_for_path(gpu_dir + "gpu_busy_percent").load_contents_async(null, (file, response) => {
+        let [success, contents, tag] = file.load_contents_finish(response);
+        if(success) {
+          this.gpu_use = parseInt(ByteArray.toString(contents));
+        }
+        GLib.free(contents);
+      });
+    },
+
+    get_amdgpu_gpu_mem: function() {
+      // Sysfs directory with files related to the chosen gpu
+      let gpu_dir = "/sys/class/drm/card" + this.gpu_id + "/device/";
+
+      // File mem_info_vram_total contains the total amount of gpu VRAM in bytes
+      Gio.File.new_for_path(gpu_dir + "mem_info_vram_total").load_contents_async(null, (file, response) => {
+        let [success, contents, tag] = file.load_contents_finish(response);
+        if(success) {
+          let mem_tot = parseInt(ByteArray.toString(contents));
+          if (this.data_prefix_gpumem == 1) {
+            this.gpu_mem[0] = mem_tot / GB_TO_B;
+          } else {
+            this.gpu_mem[0] = mem_tot / 1024 / 1024 / GIB_TO_MIB;
+          }
+        }
+        GLib.free(contents);
+      });
+
+      // File mem_info_vram_used contains the used amount of gpu VRAM in bytes
+      Gio.File.new_for_path(gpu_dir + "mem_info_vram_used").load_contents_async(null, (file, response) => {
+        let [success, contents, tag] = file.load_contents_finish(response);
+        if(success) {
+          let mem_usd = parseInt(ByteArray.toString(contents));
+          if (this.data_prefix_gpumem == 1) {
+            this.gpu_mem[1] = mem_usd / GB_TO_B;
+          } else {
+            this.gpu_mem[1] = mem_usd / 1024 / 1024 / GIB_TO_MIB;
+          }
+        }
+        GLib.free(contents);
+      });
     }
 
 };

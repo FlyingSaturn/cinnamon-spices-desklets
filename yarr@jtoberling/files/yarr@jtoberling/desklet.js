@@ -10,7 +10,6 @@ const Mainloop = imports.mainloop;
 const Soup = imports.gi.Soup;
 const Signals = imports.signals;
 const SignalManager = imports.misc.signalManager;
-const GObject = imports.gi.GObject;
 const Gio = imports.gi.Gio;
 const Tooltips = imports.ui.tooltips
 const ModalDialog = imports.ui.modalDialog;
@@ -23,141 +22,256 @@ const ByteArray = imports.byteArray;
 const UUID = "yarr@jtoberling";
 const DESKLET_ROOT = imports.ui.deskletManager.deskletMeta[UUID].path;
 
-
 function _(str) {
-  return Gettext.dgettext(UUID, str);
+    return Gettext.dgettext(UUID, str);
 }
-
 
 class YarrDesklet extends Desklet.Desklet {
 
     statusOk = false;
-    
+
     delay = 300;
-    
+
     refreshEnabled = true;
-    
+
     httpSession = null;
-    
+
     xmlutil = null;
-    
+
     items = new Map();
-    
+
     dataBox = null;	// Object holder for display
     headTitle = null;
-    
-    timerInProgress = false;		// Semaphore
+
+    timerInProgress = 0;
     _setUpdateTimerInProgress = false; 	// Semaphore
 
-    onUpdateDownloadedTick = -1;    
+    onUpdateDownloadedTick = -1;
     updateDownloadCounter = -1;
     updateDownloadedTimer = -1;
-    
+
 
     clipboard = St.Clipboard.get_default();
 
-    constructor (metadata, desklet_id) {
+    // Add new property for search
+    searchFilter = '';
 
-        // translation init: if installed in user context, switch to translations in user's home dir
-        if(!DESKLET_ROOT.startsWith("/usr/share/")) {
-                Gettext.bindtextdomain(UUID, GLib.get_home_dir() + "/.local/share/locale");
-        }
-        
+    // Add new property for favorite feature
+    enableFavoriteFeature = true; // Default value
+
+    // Add new property for favorite filtering
+    showOnlyFavorites = false;
+
+    // Add resource monitoring
+    _resourceUsage = {
+        lastUpdate: 0,
+        updateCount: 0,
+        errorCount: 0
+    };
+
+    // Adaptive refresh rate
+    _adaptiveRefresh = {
+        minDelay: 300,  // 5 minutes
+        maxDelay: 1800, // 30 minutes
+        currentDelay: 300
+    };
+
+    // Add to class properties
+    favoritesDb = null;
+    favoriteKeys = new Set();
+
+    // Add new settings binding
+    loadFavoritesOnStartup = true;
+
+    // Add new settings binding
+    articleSpacing = 0.2;
+
+    lastRefresh = null;
+
+    constructor(metadata, desklet_id) {
+
+        // Call parent constructor FIRST
         super(metadata, desklet_id);
-        this.metadata = metadata;
 
-        this.uuid = this.metadata["UUID"];
-        
-        this.settings = new Settings.DeskletSettings(this, this.metadata.uuid, this.instance_id);
+        // translation init
+        if (!DESKLET_ROOT.startsWith("/usr/share/")) {
+            Gettext.bindtextdomain(UUID, GLib.get_home_dir() + "/.local/share/locale");
+        }
 
-        this.STORE_SCHEMA = new Secret.Schema("org.YarrDesklet.Schema",Secret.SchemaFlags.NONE,{});
+        // Initialize Secret schema
+        this.STORE_SCHEMA = new Secret.Schema("org.YarrDesklet.Schema", Secret.SchemaFlags.NONE, {});
 
-        this.settings.bind('refreshInterval-spinner', 'delay'); //, this.onSettingsChanged);
-        this.settings.bind('feeds', 'feeds'); //, this.onSettingsChanged);
-        this.settings.bind("height", "height"); //, this.onDisplayChanged);
-        this.settings.bind("width", "width"); //, this.onDisplayChanged);
-        this.settings.bind("transparency", "transparency"); //, this.onDisplayChanged);
-        this.settings.bind("alternateRowTransparency", "alternateRowTransparency"); //, this.onDisplayChanged);
-        this.settings.bind("backgroundColor", "backgroundColor"); //, this.onDisplayChanged);
-        this.settings.bind("font", "font"); //, this.onDisplayChanged);
-        this.settings.bind("text-color", "color"); //, this.onDisplayChanged);
-        this.settings.bind("numberofitems", "itemlimit"); //, this.onSettingsChanged, 50);
-        this.settings.bind("listfilter", "listfilter"); //, this.onSetttingChanged);
-        this.settings.bind('enablecopy', 'enablecopy'); 
-        
-        this.settings.bind('ai_enablesummary', 'ai_enablesummary'); //, this.onDisplayChanged);
-        this.settings.bind('ai_dumptool', 'ai_dumptool'); //, this.onDisplayChanged);
-        this.settings.bind('ai_url', 'ai_url'); //, this.onDisplayChanged);
-        this.settings.bind('ai_systemprompt', 'ai_systemprompt'); //, this.onDisplayChanged);
-        this.settings.bind('ai_use_standard_model', 'ai_use_standard_model'); //, this.onDisplayChanged);
-        this.settings.bind('ai_model', 'ai_model'); //, this.onDisplayChanged);
-        this.settings.bind('ai_custom_model', 'ai_custom_model'); //, this.onDisplayChanged);
-        this.settings.bind("ai_font", "ai_font"); //, this.onDisplayChanged);
-        this.settings.bind("ai_text-color", "ai_color"); //, this.onDisplayChanged);
-        
+        // Initialize basic properties
+        this.refreshEnabled = true;
+        this.delay = 300; // 5 minutes default
+        this.items = new Map();
+        this._updateInProgress = false;
+        this.timerInProgress = 0;
+        this._setUpdateTimerInProgress = false;
+
+        // Initialize settings
+        this.settings = new Settings.DeskletSettings(this, metadata.uuid, desklet_id);
+
+        // Initialize HTTP session
         if (Soup.MAJOR_VERSION === 2) {
             this.httpSession = new Soup.SessionAsync();
+            Soup.Session.prototype.add_feature.call(this.httpSession, new Soup.ProxyResolverDefault());
         } else {
             this.httpSession = new Soup.Session();
         }
 
+        this.httpSession.timeout = 60;
+        this.httpSession.idle_timeout = 60;
+        this.httpSession.user_agent = 'Mozilla/5.0 YarrDesklet/1.0';
+
+        // Bind all settings
+        this.settings.bind('refreshInterval-spinner', 'delay');
+        this.settings.bind('feeds', 'feeds');
+        this.settings.bind("height", "height");
+        this.settings.bind("width", "width");
+        this.settings.bind("transparency", "transparency");
+        this.settings.bind("alternateRowTransparency", "alternateRowTransparency");
+        this.settings.bind("backgroundColor", "backgroundColor");
+        this.settings.bind("font", "font");
+        this.settings.bind("text-color", "color");
+        this.settings.bind("numberofitems", "itemlimit");
+        this.settings.bind("listfilter", "listfilter");
+        this.settings.bind('enablecopy', 'enablecopy');
+
+        this.settings.bind('ai_enablesummary', 'ai_enablesummary');
+        this.settings.bind('ai_add_description_to_summary', 'ai_add_description_to_summary');
+        this.settings.bind('ai_dumptool', 'ai_dumptool');
+        this.settings.bind('ai_url', 'ai_url');
+        this.settings.bind('ai_systemprompt', 'ai_systemprompt');
+        this.settings.bind('ai_use_standard_model', 'ai_use_standard_model');
+        this.settings.bind('ai_model', 'ai_model');
+        this.settings.bind('ai_custom_model', 'ai_custom_model');
+        this.settings.bind("ai_font", "ai_font");
+        this.settings.bind("ai_text-color", "ai_color");
+        this.settings.bind("temperature", "temperature");
+
+        // Add new settings bindings
+        this.settings.bind('enableFeedButton', 'enableFeedButton');
+        this.settings.bind('enableTimestamp', 'enableTimestamp');
+        this.settings.bind('enableFavoriteFeature', 'enableFavoriteFeature');
+        this.settings.bind('loadFavoritesOnStartup', 'loadFavoritesOnStartup');
+        this.settings.bind("articleSpacing", "articleSpacing");
+
+        // Initialize SignalManager
         this._signals = new SignalManager.SignalManager(null);
 
+        // Load feeds from settings
+        this.feeds = this.settings.getValue('feeds');
+
+        // Initialize favorites database
+        this.favoritesDb = new FavoritesDB();
+        this.favoriteKeys = this.favoritesDb.getFavorites();
+
+        // Load favorites if enabled
+        if (this.loadFavoritesOnStartup) {
+            this.loadFavoriteArticles();
+        }
+
+        // Build UI
         this.buildInitialDisplay();
         this.onDisplayChanged();
         this.onSettingsChanged();
 
-        this.setUpdateTimer(1);
+        // Start initial feed collection
+        this.setUpdateTimer(1);  // Start first update in 1 second
 
+        // Force immediate feed collection after short delay
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+            this.collectFeeds();
+            return GLib.SOURCE_REMOVE;
+        });
+
+        // Add cleanup handler
+        this.actor.connect('destroy', () => this._onDestroy());
+
+
+    }
+
+    _onDestroy() {
+        try {
+            // Clear timers
+            if (this.timerInProgress) {
+                Mainloop.source_remove(this.timerInProgress);
+            }
+            if (this.updateDownloadedTimer) {
+                Mainloop.source_remove(this.updateDownloadedTimer);
+            }
+
+            // Disconnect signals
+            this._signals.disconnectAllSignals();
+
+            // Clear items map
+            this.items.clear();
+
+            // Clean up menu
+            if (this._menu) {
+                this._menu.destroy();
+            }
+
+            // Clear HTTP session
+            if (this.httpSession) {
+                this.httpSession.abort();
+                this.httpSession = null;
+            }
+        } catch (e) {
+            global.log('Error in _onDestroy:', e);
+        }
     }
 
     invertbrightness(rgb) {
-        rgb = Array.prototype.join.call(arguments).match(/(-?[0-9\.]+)/g);
-        let brightness = 255 * 3
-        for (var i = 0; i < rgb.length && i < 3; i++) {
+        rgb = Array.prototype.join.call(arguments).match(/(-?[0-9.]+)/g);
+        let brightness = 255 * 3;
+        for (let i = 0; i < rgb.length && i < 3; i++) {
             brightness -= rgb[i];
         }
-        if (brightness > 255 * 1.5)
-            return '255, 255, 255';
-        return '0, 0, 0';
+        return brightness > 255 * 1.5 ? '255, 255, 255' : '0, 0, 0';
     }
-    
+
     openChatGPTAPIKeys() {
         Gio.app_info_launch_default_for_uri("https://platform.openai.com/api-keys", global.create_app_launch_context());
     }
-    
+
     openChatGPTUsage() {
         Gio.app_info_launch_default_for_uri("https://platform.openai.com/usage", global.create_app_launch_context());
     }
-    
+
     onAIPromptExample1() {
         this.ai_systemprompt = 'Summarize in four sentences.';
     }
-    
+
     onAIPromptExample2() {
         this.ai_systemprompt = 'Foglald össze limerick-ben.';
     }
-    
+
     onAIPromptExample3() {
         this.ai_systemprompt = '俳句のエッセンス\n日本語では';
     }
-    
+
     onAIPromptExample4() {
         this.ai_systemprompt = 'Foglald össze 4 mondatban.';
     }
-    
+
     onAIPromptExample5() {
         this.ai_systemprompt = 'Summarize in 4-8 short bullet points, separtate lines, English language.\nOmit other references and external links from the summary.';
     }
-    
+
     onAIPromptExample6() {
         this.ai_systemprompt = 'Foglald össze 4-8 rövid bullet pontban, mind külön sorban, magyarul.\nHaggyd ki a többi az oldalon olvasható cikket és hivatkozást a felsorolásból.';
     }
-    
+
 
     onRefreshSettings() {
+        // Existing display updates
         this.onDisplayChanged();
         this.onSettingsChanged();
+
+        // Add items redisplay
+        this.displayItems();
     }
 
     onSettingsChanged() {
@@ -171,14 +285,14 @@ class YarrDesklet extends Desklet.Desklet {
         let fontweight = '';
         let fontstyle = '';
         let fontname = fontprep.join(' ').replace(/,/g, ' ');
-        ['Italic', 'Oblique'].forEach(function(item, i) {
+        ['Italic', 'Oblique'].forEach(function (item, i) {
             if (fontname.includes(item)) {
                 fontstyle = item;
                 fontname = fontname.replace(item, '');
             }
         });
 
-        ['Bold', 'Light', 'Medium', 'Heavy'].forEach(function(item, i) {
+        ['Bold', 'Light', 'Medium', 'Heavy'].forEach(function (item, i) {
             if (fontname.includes(item)) {
                 fontweight = item;
                 fontname = fontname.replace(item, '');
@@ -200,14 +314,14 @@ class YarrDesklet extends Desklet.Desklet {
         let ai_fontweight = '';
         let ai_fontstyle = '';
         let ai_fontname = ai_fontprep.join(' ').replace(/,/g, ' ');
-        ['Italic', 'Oblique'].forEach(function(item, i) {
+        ['Italic', 'Oblique'].forEach(function (item, i) {
             if (ai_fontname.includes(item)) {
                 ai_fontstyle = item;
                 ai_fontname = ai_fontname.replace(item, '');
             }
         });
 
-        ['Bold', 'Light', 'Medium', 'Heavy'].forEach(function(item, i) {
+        ['Bold', 'Light', 'Medium', 'Heavy'].forEach(function (item, i) {
             if (ai_fontname.includes(item)) {
                 ai_fontweight = item;
                 ai_fontname = ai_fontname.replace(item, '');
@@ -224,96 +338,171 @@ class YarrDesklet extends Desklet.Desklet {
 
         this.mainBox.set_size(this.width, this.height);
 
-        this.mainBox.style = "background-color: rgba(" + (this.backgroundColor.replace('rgb(', '').replace(')', '')) + "," + this.transparency + ")";
+        this.mainBox.style = "background-color: rgba(" + (this.backgroundColor.replace('rgb(', '').replace(')', '') + "," + this.transparency + ")");
     }
 
     //------------------------
 
-    //HTTP request creator function
-    /*
-        This function creates all of our HTTP requests.
-    */
-    httpRequest(method,url,headers,postParameters,callbackF, bodyMime='application/x-www-form-urlencoded') {
-    
-        var message = Soup.Message.new(
-            method,
-            url
-        );
-
-        if (headers !== null) {
-            for (let i = 0;i < headers.length;i++) {
-                message.request_headers.append(headers[i][0],headers[i][1]);
-            }
-        }
-        if (Soup.MAJOR_VERSION === 2) {
-            if (postParameters !== null) {
-                message.set_request(bodyMime,2,postParameters);
-            }
-
-            this.httpSession.queue_message(message,
-
-                Lang.bind(this, function(session, response) {
-
-                  let body = response.response_body.data;
-
-                  let result = {
-                    result: ''
-                  }; 
-                  try {
-                      result = message.response_body.data;
-                  } catch(e) {
-                      global.log('ERROR', e);
-                  }
-                  
-                  callbackF(this, message, result);
-                })
-            );
-        } else {
-            if (postParameters !== null) {
-                const bytes = GLib.Bytes.new(ByteArray.fromString(postParameters));
-                message.set_request_body_from_bytes(bodyMime, bytes);
-            }
-
-            this.httpSession.send_and_read_async(message, 0, null, (session, res) => {
-                let result = {
-                    result: ''
-                };
-                try {
-                    const bytes = session.send_and_read_finish(res);
-                    result = ByteArray.toString(bytes.get_data());
-                } catch (e) {
-                    global.log('ERROR', e);
+    // HTTP request creator function
+    httpRequest(method, url, headers = null, body = null) {
+        return new Promise((resolve, reject) => {
+            try {
+                const message = Soup.Message.new(method, url);
+                if (!message) {
+                    throw new Error(`Failed to create message for URL: ${url}`);
                 }
 
-                callbackF(this, message, result);
-            });
-        }
+                // Add headers
+                message.request_headers.append('User-Agent', 'Mozilla/5.0 YarrDesklet/1.0');
+                if (headers) {
+                    headers.forEach(([key, value]) => {
+                        message.request_headers.append(key, value);
+                    });
+                }
+
+                // Add body for POST requests
+                if (method === 'POST' && body) {
+                    if (Soup.MAJOR_VERSION === 2) {
+                        message.set_request('application/json', 2, body);
+                    } else {
+                        message.set_request_body_from_bytes('application/json',
+                            new GLib.Bytes(body));
+                    }
+                }
+
+                // Handle Soup v2 vs v3
+                if (Soup.MAJOR_VERSION === 2) {
+                    this.httpSession.queue_message(message, (session, response) => {
+                        if (response.status_code !== 200) {
+                            reject(new Error(`HTTP ${response.status_code}: ${response.reason_phrase}`));
+                            return;
+                        }
+                        resolve(message.response_body.data);
+                    });
+                } else {
+                    this.httpSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null,
+                        (session, result) => {
+                            try {
+                                const bytes = session.send_and_read_finish(result);
+                                if (!bytes) {
+                                    reject(new Error('No response data'));
+                                    return;
+                                }
+                                const response = ByteArray.toString(bytes.get_data());
+                                resolve(response);
+                            } catch (error) {
+                                reject(error);
+                            }
+                        });
+                }
+            } catch (error) {
+                reject(error);
+            }
+        });
     }
 
     setUpdateTimer(timeOut) {
-    
-        if (this._setUpdateTimerInProgress) {
-            return;
-        }
+        if (this._setUpdateTimerInProgress) return;
         this._setUpdateTimerInProgress = true;
-    
 
-        if (this.timerInProgress) {
-            Mainloop.source_remove(this.timerInProgress);
+        try {
+            // Clear existing timer if any
+            if (this.timerInProgress) {
+                try {
+                    Mainloop.source_remove(this.timerInProgress);
+                } catch (e) {
+                    global.log('Error removing existing timer:', e);
+                }
+                this.timerInProgress = 0;
+            }
+
+            // Set minimum delay to prevent excessive CPU usage
+            const delay = Math.max(timeOut === 1 ? 1 : 300, this.delay);
+
+            // Create new timer
+            this.timerInProgress = Mainloop.timeout_add_seconds(delay, () => {
+                // Clear timer ID since it's about to fire
+                this.timerInProgress = 0;
+
+                // Execute timer event
+                this.onTimerEvent();
+
+                // Return false to prevent auto-repeat
+                return false;
+            });
+
+            if (!this.timerInProgress) {
+                global.log('Failed to create timer');
+            }
+
+        } catch (e) {
+            global.log('Error in setUpdateTimer:', e);
+            this.timerInProgress = 0;
+        } finally {
+            this._setUpdateTimerInProgress = false;
         }
-        
-        this.timerInProgress = Mainloop.timeout_add_seconds(timeOut, Lang.bind(this, this.onTimerEvent));
-        
-        this._setUpdateTimerInProgress = false;
     }
 
+    onTimerEvent() {
+        // Prevent concurrent updates
+        if (this._updateInProgress) {
+            this.setUpdateTimer(this.delay);
+            return;
+        }
+
+        this._updateInProgress = true;
+
+        try {
+            // Execute feed collection
+            this.collectFeeds()
+                .catch(error => {
+                    global.log('Error collecting feeds:', error);
+                })
+                .finally(() => {
+                    this._updateInProgress = false;
+                    global.log('Feed collection completed, scheduling next update');
+                    // Schedule next update
+                    if (this.refreshEnabled) {
+                        this.setUpdateTimer(this.delay);
+                    }
+                });
+        } catch (e) {
+            global.log('Error in timer event:', e);
+            this._updateInProgress = false;
+            if (this.refreshEnabled) {
+                this.setUpdateTimer(this.delay);
+            }
+        }
+    }
 
     onRefreshClicked() {
-        this.setUpdateTimer(3);
+        // Set refresh icon to indicate loading
+        if (this.refreshIcon) {
+            this.refreshIcon.set_icon_name('process-working');
+        }
+
+        // Immediately collect feeds
+        this.collectFeeds()
+            .then(() => {
+                // Reset icon after successful refresh
+                if (this.refreshIcon) {
+                    this.refreshIcon.set_icon_name('reload');
+                }
+            })
+            .catch(error => {
+                // Reset icon and log error
+                if (this.refreshIcon) {
+                    this.refreshIcon.set_icon_name('reload');
+                }
+                global.log('Error refreshing feeds:', error);
+            });
+
+        // Also reset the timer for next automatic refresh
+        this.setUpdateTimer(this.delay);
     }
 
     onClickedToggleRefresh(selfObj, p2, context) {
-    
+
         if (context.refreshEnabled) {
             context.toggleRefresh.set_label(_('Enable refresh'));
             context.toggleRefresh.set_style_class_name('toggleButtonOff');
@@ -325,546 +514,829 @@ class YarrDesklet extends Desklet.Desklet {
             context.setUpdateTimer(3);
         }
     }
-    
+
     buildInitialDisplay() {
-    
         this.setHeader(_('Yarr'));
-        
+
+        // Main container
         this.mainBox = new St.BoxLayout({
             vertical: true,
             width: this.width,
             height: this.height,
             style_class: "desklet"
         });
-        
 
-        this.headBox = new St.BoxLayout({ vertical: false });
-            
-        this.headTitle = new St.Label({});
-        
-        this.headTitle.set_text(_('Loading: feeds ...' ));
-        
-        let paddingBox = new St.Bin({ width: 10 });
-    
-        this.refreshButton = new St.Button({style_class: 'feedRefreshButton'});
-        
-        this.refreshIcon = new St.Icon({
-                          icon_name: 'reload',
-                          icon_size: 20, 
-                          icon_type: St.IconType.SYMBOLIC
+        // Fixed height header container that won't be affected by scroll
+        this.headerContainer = new St.BoxLayout({
+            vertical: true,
+            x_expand: true,
+            height: 40,
+            style: 'min-height: 40px; background-color: rgba(0,0,0,0.2);'  // Make header visually distinct
         });
-        
+
+        // Header content
+        this.headBox = new St.BoxLayout({
+            vertical: false,
+            x_expand: true,
+            style: 'padding: 4px; margin: 0 1rem;'
+        });
+
+        // Left side: Title and search
+        let leftBox = new St.BoxLayout({
+            vertical: false,
+            style: 'spacing: 10px;'
+        });
+
+        // Title with icon
+        let titleBox = new St.BoxLayout({
+            vertical: false,
+            style: 'spacing: 4px;'
+        });
+
+        let titleIcon = new St.Icon({
+            icon_name: 'feed-subscribe',
+            icon_type: St.IconType.SYMBOLIC,
+            icon_size: 20,
+            style: 'padding-top: 2px;'
+        });
+
+        this.headTitle = new St.Label({
+            text: _('Loading: feeds ...'),
+            style: 'font-weight: bold; padding-top: 3px;'
+        });
+
+        titleBox.add(titleIcon);
+        titleBox.add(this.headTitle);
+        leftBox.add(titleBox);
+
+        // Add favorite filter button before search if feature is enabled
+        if (this.enableFavoriteFeature) {
+            this.favoriteFilterBtn = new St.Button({
+                style_class: 'yarr-button',
+                style: 'padding: 4px; margin-left: 10px;'
+            });
+
+            this.favoriteFilterIcon = new St.Icon({
+                icon_name: 'non-starred',
+                icon_type: St.IconType.SYMBOLIC,
+                icon_size: 16,
+                style: 'color: #888888;'
+            });
+
+            this.favoriteFilterBtn.set_child(this.favoriteFilterIcon);
+
+            this.favoriteFilterBtn.connect('clicked', () => {
+                this.showOnlyFavorites = !this.showOnlyFavorites;
+
+                // Update icon
+                this.favoriteFilterIcon.set_icon_name(this.showOnlyFavorites ? 'starred' : 'non-starred');
+                this.favoriteFilterIcon.style = this.showOnlyFavorites ? 'color: #ffd700;' : 'color: #888888;';
+
+                // Refresh display with filter
+                this.displayItems();
+            });
+
+            leftBox.add(this.favoriteFilterBtn);
+        }
+
+        // Search box after title and favorite button
+        this.searchBox = new St.BoxLayout({
+            vertical: false,
+            style: 'spacing: 4px; margin-left: 1rem;'
+        });
+
+        this.searchButton = new St.Button({
+            style_class: 'search-button',
+            style: 'padding: 4px 8px;',
+            reactive: true,
+            track_hover: true
+        });
+
+        let searchButtonBox = new St.BoxLayout();
+
+        let searchIcon = new St.Icon({
+            icon_name: 'edit-find',
+            icon_type: St.IconType.SYMBOLIC,
+            icon_size: 16
+        });
+
+        this.searchLabel = new St.Label({
+            text: _(" Search..."),
+            style: 'padding-left: 5px;'
+        });
+
+        searchButtonBox.add(searchIcon);
+        searchButtonBox.add(this.searchLabel);
+        this.searchButton.set_child(searchButtonBox);
+
+        // Add clear search button
+        this.clearSearchButton = new St.Button({
+            style_class: 'clear-search-button',
+            style: 'padding: 4px;',
+            visible: false
+        });
+
+        let clearIcon = new St.Icon({
+            icon_name: 'edit-clear',
+            icon_type: St.IconType.SYMBOLIC,
+            icon_size: 16
+        });
+        this.clearSearchButton.set_child(clearIcon);
+
+        // Connect search button to show modal dialog
+        this.searchButton.connect('clicked', () => {
+            let dialog = new ModalDialog.ModalDialog();
+
+            // Add title
+            let titleBin = new St.Bin({
+                style_class: 'search-title',
+                style: 'margin-bottom: 10px;'
+            });
+
+            let titleLabel = new St.Label({
+                text: _("Search Articles"),
+                style_class: 'search-title-text',
+                style: 'font-size: 16px; font-weight: bold;'
+            });
+
+            titleBin.set_child(titleLabel);
+            dialog.contentLayout.add(titleBin);
+
+            // Add search entry
+            let entry = new St.Entry({
+                name: 'searchEntry',
+                hint_text: _("Type to search..."),
+                track_hover: true,
+                reactive: true,
+                can_focus: true,
+                style: 'width: 250px; min-width: 250px;'
+            });
+
+            // Set initial text if there's an existing filter
+            if (this.searchFilter) {
+                entry.set_text(this.searchFilter);
+            }
+
+            dialog.contentLayout.add(entry);
+
+            // Handle Enter key
+            entry.clutter_text.connect('key-press-event', (actor, event) => {
+                let symbol = event.get_key_symbol();
+                if (symbol === Clutter.KEY_Return || symbol === Clutter.KEY_KP_Enter) {
+                    let text = entry.get_text();
+                    if (text) {
+                        this.searchFilter = text;
+                        this.searchLabel.text = " " + text;
+                        this.clearSearchButton.visible = true;
+                        this.displayItems(this);
+                    }
+                    dialog.close();
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
+            });
+
+            // Add buttons
+            dialog.setButtons([
+                {
+                    label: _("Cancel"),
+                    action: () => dialog.close(),
+                    key: Clutter.KEY_Escape
+                },
+                {
+                    label: _("Search"),
+                    action: () => {
+                        let text = entry.get_text();
+                        if (text) {
+                            this.searchFilter = text;
+                            this.searchLabel.text = " " + text;
+                            this.clearSearchButton.visible = true;
+                            this.displayItems(this);
+                        }
+                        dialog.close();
+                    },
+                    key: Clutter.KEY_Return
+                }
+            ]);
+
+            dialog.open();
+            global.stage.set_key_focus(entry);
+        });
+
+        // Connect clear button
+        this.clearSearchButton.connect('clicked', () => {
+            this.searchFilter = '';
+            this.searchLabel.text = _(" Search...");
+            this.clearSearchButton.visible = false;
+            this.displayItems(this);
+        });
+
+        this.searchBox.add(this.searchButton);
+        this.searchBox.add(this.clearSearchButton);
+        leftBox.add(this.searchBox);
+
+        // Right side: Control buttons with right alignment
+        let rightBox = new St.BoxLayout({
+            vertical: false,
+            style: 'spacing: 6px;',
+            x_align: St.Align.END
+        });
+
+        // Toggle refresh button with icon
+        this.toggleRefresh = new St.Button({
+            label: _("Disable refresh"),
+            style_class: 'toggleButtonOn',
+            style: 'padding: 4px 8px;'
+        });
+
+        // Refresh button with icon
+        this.refreshButton = new St.Button({
+            style_class: 'feedRefreshButton',
+            style: 'padding: 4px;'
+        });
+
+        this.refreshIcon = new St.Icon({
+            icon_name: 'reload',
+            icon_type: St.IconType.SYMBOLIC,
+            icon_size: 16
+        });
+
         this.refreshButton.set_child(this.refreshIcon);
+
+        // Connect button events
         this.refreshButton.connect("clicked", Lang.bind(this, this.onRefreshClicked));
-                        
-        this.toggleRefresh = new St.Button({ label: _("Disable refresh"), style_class: 'toggleButtonOn'});    
-        let context = this;
-        this._signals.connect( this.toggleRefresh, 'clicked', (...args) => this.onClickedToggleRefresh(...args, this) );
-        
-        this.headBox.add(this.headTitle);
-        this.headBox.add(paddingBox, { expand: true });
-        this.headBox.add_actor(this.toggleRefresh);
-        this.headBox.add_actor(this.refreshButton);
-        
-        this.mainBox.add(this.headBox);
+        this._signals.connect(this.toggleRefresh, 'clicked', (...args) =>
+            this.onClickedToggleRefresh(...args, this)
+        );
 
-        
-        this.dataBox = new St.ScrollView(); //St.BoxLayout({ vertical: true });
-        this.dataBox.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC);
+        rightBox.add(this.toggleRefresh);
+        rightBox.add(this.refreshButton);
 
-        this.tableContainer = new St.BoxLayout({ vertical: true });
-        this.dataBox.add_actor(this.tableContainer);
+        // Add everything to header with proper spacing
+        this.headBox.add(leftBox);
+        this.headBox.add(new St.Bin({ x_expand: true }));  // Flexible space
+        this.headBox.add(rightBox);
 
-        this.mainBox.add(this.dataBox, { expand: true });
+        this.headerContainer.add(this.headBox);
+
+        // Separate scrollable content container
+        let scrollContainer = new St.BoxLayout({
+            vertical: true,
+            x_expand: true,
+            y_expand: true,
+            style: 'margin-top: 2px;'
+        });
+
+        // Create scrollview with proper policy
+        let scrollBox = new St.ScrollView({
+            style_class: 'yarr-scrollbox',
+            x_fill: true,
+            y_fill: true,
+            x_expand: true,
+            y_expand: true
+        });
+
+        scrollBox.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC);
+
+        // Container for feed items
+        this.dataBox = new St.BoxLayout({
+            vertical: true,
+            style_class: 'yarr-feeds-box',
+            y_expand: true,
+            x_expand: true,
+            style: 'spacing: 2px;'
+        });
+
+        // Proper layout hierarchy
+        scrollBox.add_actor(this.dataBox);
+        scrollContainer.add(scrollBox);
+
+        // Add components in correct order
+        this.mainBox.add(this.headerContainer);  // Fixed header first
+        this.mainBox.add(scrollContainer);       // Scrollable content second
 
         this.setContent(this.mainBox);
-        
     }
 
     hashCode(str) {
-         return str.split('').reduce((prevHash, currVal) =>
-             (((prevHash << 5) - prevHash) + currVal.charCodeAt(0))|0, 0);
+        return str.split('').reduce((prevHash, currVal) =>
+            (((prevHash << 5) - prevHash) + currVal.charCodeAt(0)) | 0, 0);
     }
 
-    
-    additems(context, itemobj ) {
-        
-        let key = itemobj.title + '|' + itemobj.link;
-        let hash = context.hashCode(key);
-        
-        if (!context.items.has(hash)) {
-            context.items.set( hash, itemobj);
+
+    _cleanupItem(item) {
+        if (!item) return;
+
+        // Clear references
+        if (item.aiResponse) {
+            item.aiResponse = '';
         }
-        
-        const newMap = Array.from(context.items).sort(
-            (a,b)	=> { return Number(b[1].timestamp) - Number(a[1].timestamp); }
-        );
-        
-        context.items = new Map(newMap);
-
-        const itemsize = context.items.size;
-    
-        let i=0;
-        for( let [key, value] of context.items ) {
-            i++;
-            if (i > context.itemlimit) {
-                context.items.delete(key);
-            }
-        }        
+        if (item.description) {
+            item.description = '';
+        }
+        // Clean other fields...
     }
-    
-    inGlobalFilter(context, title, catStr, description) {
-    
-        let found = false;
-        
-        let itemRegexArr = [];
-        
-        
-        for(let i=0; i < context.listfilter.length ; i++ ) {
-        
-            let filterElem = context.listfilter[i];
-            
-            if (filterElem.active) {
-                if (filterElem.unmatch) {
-                    found = true;
-                }
-            
-                let itemRegexp = new RegExp(filterElem.filter);
 
-                if (filterElem.inTitle) {
-                    if (itemRegexp.test(title)) {
-                        found = (filterElem.unmatch)?false:true;
-                        break;
-                    }
+    additems(context, itemobj) {
+        try {
+            // Generate unique key
+            const key = `${itemobj.channel}-${itemobj.title}-${itemobj.timestamp.getTime()}`;
+
+            // Add new item to map with isFavorite property
+            context.items.set(key, {
+                ...itemobj,  // spread operator to clone
+                key: key,    // store key for later use
+                isFavorite: false  // default favorite status
+            });
+
+            // Schedule display update using Promise to avoid UI blocking
+            Promise.resolve().then(() => {
+                // Limit size and clean old elements if needed
+                if (context.items.size > context.itemlimit) {
+                    const sortedItems = Array.from(context.items.entries())
+                        .sort((a, b) => b[1].timestamp - a[1].timestamp);
+
+                    // Keep only the newest items
+                    context.items = new Map(sortedItems.slice(0, context.itemlimit));
                 }
 
-                if (filterElem.inCategory) {
-                    if (itemRegexp.test(catStr)) {
-                        found = (filterElem.unmatch)?false:true;
-                        break;
-                    }
-                }
+                // Schedule UI update
+                GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    this.displayItems();
+                    return GLib.SOURCE_REMOVE;
+                });
+            }).catch(e => {
+                global.log('Error in additems:', e);
+            });
 
-                if (filterElem.inDescription) {
-                    if (itemRegexp.test(description)) {
-                        found = (filterElem.unmatch)?false:true;
-                        break;
-                    }
-                }
+        } catch (e) {
+            global.log('Error in additems:', e);
+        }
+    }
+
+    // Helper function to check if text matches filter
+    _checkMatch(filter, title, category, description) {
+        const regexp = new RegExp(filter.filter, 'i');
+
+        return (filter.inTitle && title && regexp.test(title)) ||
+            (filter.inCategory && category && regexp.test(category)) ||
+            (filter.inDescription && description && regexp.test(description));
+    }
+
+    // Simplified main filter function
+    inGlobalFilter(self, title, category, description) {
+        if (!self?.listfilter?.length) return true;
+
+        for (const filter of self.listfilter) {
+            if (!filter?.active) continue;
+
+            try {
+                const matches = this._checkMatch(filter, title, category, description);
+                if (filter.unmatch ? !matches : matches) return false;
+            } catch {
+                continue;
             }
         }
-        return found;
+        return true;
     }
-    
+
     onUpdateDownloadedTimer() {
-
         this.onUpdateDownloadedTick++;
 
-        if ( (this.updateDownloadCounter < 1) || (this.onUpdateDownloadedTick > 10)) {
-            Mainloop.source_remove(this.updateDownloadedTimer);
+        if (this.updateDownloadCounter < 1 || this.onUpdateDownloadedTick > 10) {
+            if (this.updateDownloadedTimer) {
+                Mainloop.source_remove(this.updateDownloadedTimer);
+                this.updateDownloadedTimer = null;
+            }
             this.displayItems(this);
-            this.refreshIcon.set_icon_name('reload');
+            if (this.refreshIcon) {
+                this.refreshIcon.set_icon_name('reload');
+            }
+            return GLib.SOURCE_REMOVE;
         }
         return GLib.SOURCE_CONTINUE;
     }
-    
-    collectFeeds() {
-    
-        if (!this.refreshEnabled) {
-            return;
+
+    async collectFeeds() {
+        if (!this.refreshEnabled || !this.httpSession) return;
+
+        try {
+            const feeds = [...this.feeds].filter(f => f?.active && f?.url?.length);
+            if (!feeds?.length) return;
+
+            for (const feed of feeds) {
+                try {
+                    const result = await this.httpRequest('GET', feed.url);
+                    this.processFeedResult(feed, result);
+                } catch (error) {
+                    global.log(`Error processing feed ${feed.name}:`, error);
+                }
+            }
+
+            this.lastRefresh = new Date();
+            this.displayItems(this);
+        } catch (error) {
+            global.log('Error in collectFeeds:', error);
+            throw error;
         }
-    
-        let freshItems = [];
-        
-        this.refreshIcon.set_icon_name('system-run');
-
-        this.updateDownloadCounter = this.feeds.length -1;
-        this.onUpdateDownloadedTick = 0;
-        this.updateDownloadedTimer = Mainloop.timeout_add_seconds(1, Lang.bind(this, this.onUpdateDownloadedTimer));
-        
-        for(let i=0; i < this.feeds.length; i++ ) {
-            
-            let feed = this.feeds[i];
-            let feedRegexp = new RegExp(feed.filter);
-
-            if (feed.active && feed.url.length > 0) {
-                    
-                    this.httpRequest('GET', feed.url, 
-                        null,  // headers
-                        null,  // post
-                        function(context, message, result) {
-                        
-                            let resJSON = null;
-                            try {
-                                resJSON = fromXML(result);
-                                
-                                let channel = resJSON.rss.channel.title;
-                                
-                                for(let j=0; j < resJSON.rss.channel.item.length ; j++ ) {
-                                
-                                    let item = resJSON.rss.channel.item[j];
-                                    
-                                    let catStr = context.getCategoryString(item);
-                                    
-                                    let doInsert = true;
-                                    if (feed.filter.length > 0)  {
-                                        doInsert = feedRegexp.test(catStr);                                    
-                                    }
-                                    
-                                    if (context.listfilter.length > 0 && context.inGlobalFilter(context, item.title, catStr, item.description)) {
-                                        doInsert = false;
-                                    }
-                                    
-                                    if (doInsert) {
-                                        let parsedDate = new Date(item.pubDate);
-                                        context.additems(
-                                            context,
-                                            { 
-                                                'channel': 	feed.name,
-                                                'timestamp': 	parsedDate,
-                                                'pubDate':	item.pubDate, 
-                                                'title':	item.title, 
-                                                'link':		item.link,
-                                                'category': 	catStr,
-                                                'description': 	item.description, 
-                                                'labelColor': 	feed.labelcolor,
-                                                'aiResponse': 	''
-                                             }
-                                        );
-                                    }
-                                }
-                          
-//                                context.displayItems(context);
-                                
-                            } catch (e) {
-                                global.log('ERROR', 'PARSEERROR');
-                                global.log(e);
-                            }
-
-                          context.updateDownloadCounter--;
-                            
-                        }
-                    );                                    
-            }            
-        }
-
     }
-    
+
     HTMLPartToTextPart(HTMLPart) {
-      return HTMLPart
-        .replace(/\n/ig, '')
-        .replace(/<style[^>]*>[\s\S]*?<\/style[^>]*>/ig, '')
-        .replace(/<head[^>]*>[\s\S]*?<\/head[^>]*>/ig, '')
-        .replace(/<script[^>]*>[\s\S]*?<\/script[^>]*>/ig, '')
-        .replace(/<\/\s*(?:p|div)>/ig, '\n\n')
-        .replace(/<br[^>]*\/?>/ig, '\n')
-        .replace(/<[^>]*>/ig, '')
-        .replace('&nbsp;', ' ')
-        .replace(/[^\S\r\n][^\S\r\n]+/ig, ' ')
-      ;
+        return HTMLPart
+            .replace(/\n/ig, '')
+            .replace(/<style[^>]*>[\s\S]*?<\/style[^>]*>/ig, '')
+            .replace(/<head[^>]*>[\s\S]*?<\/head[^>]*>/ig, '')
+            .replace(/<script[^>]*>[\s\S]*?<\/script[^>]*>/ig, '')
+            .replace(/<\/\s*(?:p|div)>/ig, '\n\n')
+            .replace(/<br[^>]*\/?>/ig, '\n')
+            .replace(/<[^>]*>/ig, '')
+            .replace('&nbsp;', ' ')
+            .replace(/[^\S\r\n][^\S\r\n]+/ig, ' ')
+            ;
     }
 
     getCategoryString(item) {
-            let catStr = '';
+        if (typeof item.category === 'string') {
+            return item.category.toString();
+        }
 
-            if (typeof item.category === 'string') {
-                catStr = item.category.toString();
-            } else {
-                if (typeof item.category === 'object') {
-                    let catArr = Array.from(item.category);
-                    let arrText = [];
-                    for(let i=0; i < catArr.length ; i++ ) {
-                        if (typeof catArr[i] === 'string' ) {
-                            arrText.push( catArr[i] );
-                        } else {
-                            arrText.push( catArr[i]['#'] );
-                        }
-                    }
-                    catStr = arrText.join(' / ');
-                }
-            }
-            
-            return catStr;
-    } 
-    
-    _formatedDate( pDate, withYear = true ) {
+        if (typeof item.category === 'object') {
+            let catArr = Array.from(item.category);
+            let arrText = catArr.map(elem =>
+                typeof elem === 'string' ? elem : elem['#']
+            );
+            return arrText.join(' / ');
+        }
+
+        return '';
+    }
+
+    _formatedDate(pDate, withYear = true) {
         let retStr = '';
         if (withYear) {
             retStr += pDate.getFullYear().toString() + '-';
         }
-        retStr +=(pDate.getMonth()+1).toString().padStart(2,'0') + '-' + pDate.getDate().toString().padStart(2,'0') + ' ' +
-                 pDate.getHours().toString().padStart(2,'0') + ':' +  pDate.getMinutes().toString().padStart(2, '0');
+        retStr += (pDate.getMonth() + 1).toString().padStart(2, '0') + '-' + pDate.getDate().toString().padStart(2, '0') + '\n' +
+            pDate.getHours().toString().padStart(2, '0') + ':' + pDate.getMinutes().toString().padStart(2, '0');
         return retStr;
     }
-    
+
     onClickedButton(selfObj, p2, uri) {
         Gio.app_info_launch_default_for_uri(uri, global.create_app_launch_context());
     }
-    
+
     onClickedSumButton(selfObj, p2, item, lineBox, sumIcon) {
-        this.summarizeUri(this.ai_dumptool, item, lineBox, sumIcon);
+        if (sumIcon) {
+            sumIcon.set_icon_name('process-working-symbolic');
+        }
+
+        this.summarizeUri(this.ai_dumptool, item, lineBox, sumIcon)
+            .then(() => {
+                if (sumIcon) {
+                    sumIcon.set_icon_name('document-edit-symbolic');
+                }
+            })
+            .catch(() => {
+                if (sumIcon) {
+                    sumIcon.set_icon_name('dialog-error-symbolic');
+                }
+            });
     }
-    
+
+    async summarizeUri(dumptool, item, lineBox, sumIcon) {
+        try {
+            const apiKey = await Secret.password_lookup_sync(this.STORE_SCHEMA, {}, null);
+            if (!apiKey) {
+                throw new Error('No API key found. Please set your API key in settings.');
+            }
+
+            // First get the full article content using dumptool
+            const [success, stdout, stderr] = GLib.spawn_command_line_sync(
+                `/usr/bin/timeout -k 10 10 /usr/bin/${dumptool} -dump '${item.link}' || echo 'ERROR: TIMEOUT'`
+            );
+
+            if (!success) {
+                throw new Error(`Failed to get article content: ${stderr.toString()}`);
+            }
+
+            let articleContent =
+                `${item.title}\n${this.HTMLPartToTextPart(item.description)}\n` +
+                ByteArray.toString(stdout);
+
+            // Limit content length to prevent API issues
+            if (articleContent.length > 16384) {
+                articleContent = articleContent.substring(0, 16384);
+            }
+
+            const requestBody = {
+                model: this.ai_use_standard_model ? this.ai_model : this.ai_custom_model,
+                messages: [
+                    {
+                        role: "system",
+                        content: this.ai_systemprompt
+                    },
+                    {
+                        role: "user",
+                        content: articleContent
+                    }
+                ],
+                temperature: this.temperature
+            };
+
+            const response = await this.httpRequest(
+                'POST',
+                this.ai_url,
+                [
+                    ['Content-Type', 'application/json'],
+                    ['Authorization', `Bearer ${apiKey}`]
+                ],
+                JSON.stringify(requestBody)
+            );
+
+            const jsonResponse = JSON.parse(response);
+
+            if (!jsonResponse?.choices?.[0]) {
+                throw new Error('Invalid API response');
+            }
+
+            item.aiResponse = "";
+
+            if (this.ai_add_description_to_summary) {
+                item.aiResponse = this.HTMLPartToTextPart(item.description).replace(/\n/ig, ' ') + '\n----\n';
+            }
+
+            item.aiResponse += jsonResponse.choices[0].message.content;
+
+            this.displayItems();
+
+            if (sumIcon) {
+                sumIcon.set_icon_name('document-edit-symbolic');
+            }
+
+        } catch (error) {
+            global.log('Error in summarizeUri:', error);
+            if (sumIcon) {
+                sumIcon.set_icon_name('dialog-error-symbolic');
+            }
+            throw error;
+        }
+    }
+
     onClickedCopyButton(selfObj, p2, item, lineBox) {
-    
+
         const message = item.channel + ' ' + item.category + ' @' + item.pubDate + '\n' +
             item.title + '\n' +
-            '---------------------------\n' + 
-            item.description + '\n' + 
-            '---------------------------\n' + 
+            '---------------------------\n' +
+            item.description + '\n' +
+            '---------------------------\n' +
             item.aiResponse + '\n' +
-            '---------------------------\n' + 
+            '---------------------------\n' +
             'URL: ' + item.link + '\n'
-        ;
-        
+            ;
+
         this.clipboard.set_text(St.ClipboardType.CLIPBOARD, message);
-        
+
     }
-    
-    
-    displayItems(context) {
-    
-        let updated= new Date();
-        context.headTitle.set_text(_('Updated') + ': ' + context._formatedDate(new Date()));
-    
-        context.tableContainer.destroy_all_children();
-        
-        let counter = 0;
-        for(let [key, item] of context.items ) {
-            counter++;
-            const lineBox = new St.BoxLayout({ vertical: false }); 
 
-            const feedButton = new St.Button({ label: "["+item.channel +"]" , style_class: 'channelbutton', style: 'width: 80px; background-color: ' + item.labelColor });
 
-            let toolTipText = 
-                '<big><b><u>' + this.formatTextWrap(item.channel + ': ' + item.title, 100) + '</u></b></big>'
-                +'\n<small>[ ' + item.category.toString().substring(0,80) + ' ]</small>\n\n'
-                + this.formatTextWrap(this.HTMLPartToTextPart(item.description ?? '-' ),100) 
-                ;
-/*                
-            let toolTip = new Tooltips.Tooltip(feedButton, toolTipText );
-            toolTip._tooltip.style = 'text-align: left;';
-            toolTip._tooltip.clutter_text.set_use_markup(true);
-            toolTip._tooltip.clutter_text.allocate_preferred_size(Clutter.AllocationFlags.NONE);
-            toolTip._tooltip.queue_relayout();
-*/
-            lineBox.add(feedButton);
+    displayItems() {
+        try {
+            if (!this.dataBox) return;
+            this.dataBox.destroy_all_children();
 
-            this._signals.connect( feedButton, 'clicked', (...args) => this.onClickedButton(...args, item.link) ); 
+            // Calculate effective item limit
+            let effectiveLimit = this.itemlimit || 50;
+            if (this.loadFavoritesOnStartup) {
+                // Count favorite items
+                const favoriteCount = Array.from(this.items.values())
+                    .filter(item => item.isFavorite).length;
+                effectiveLimit += favoriteCount;
+            }
 
-            const itemBoxLayout = new St.BoxLayout({ vertical: true });
+            // Get filtered and sorted items
+            const sortedItems = Array.from(this.items.values())
+                .filter(item => {
+                    // Apply favorite filter if enabled
+                    if (this.showOnlyFavorites && !item.isFavorite) {
+                        return false;
+                    }
 
-            if (this.ai_enablesummary) {
-                const sumButton = new St.Button({ style: 'width: 24px;'});
-                const sumIcon = new St.Icon({
-                              icon_name: 'gtk-zoom-fit',
-                              icon_size: 20, 
-                              icon_type: St.IconType.SYMBOLIC
+                    // Apply search filter
+                    if (this.searchFilter) {
+                        const searchText = this.searchFilter.toLowerCase();
+                        return item.title.toLowerCase().includes(searchText) ||
+                            item.description.toLowerCase().includes(searchText);
+                    }
+                    return this.inGlobalFilter(this, item.title, item.category, item.description);
+                })
+                .sort((a, b) => b.timestamp - a.timestamp)
+                .slice(0, effectiveLimit);  // Use effectiveLimit instead of itemlimit
+
+            // Update header text with additional info about favorites
+            if (this.headTitle) {
+                const now = this.lastRefresh ?? new Date(0);
+
+                const timeStr =
+                    (now.getMonth() + 1).toString().padStart(2, '0') + '-' +
+                    now.getDate().toString().padStart(2, '0') + ' ' +
+                    now.getHours().toString().padStart(2, '0') + ':' +
+                    now.getMinutes().toString().padStart(2, '0');
+                let titleText = _('Last refresh: %s').format(timeStr);
+                this.headTitle.set_text(titleText);
+            }
+
+            // Calculate channel width once
+            const channelWidth = Math.min(Math.max(...sortedItems.map(item => item.channel.length)) * 8, 120);
+
+            // Create items
+            sortedItems.forEach((item, i) => {
+                // Main row container
+                const lineBox = new St.BoxLayout({
+                    vertical: false,
+                    style: `
+                        background-color: ${i % 2 ?
+                            `rgba(100,100,100, ${this.alternateRowTransparency})` :
+                            `rgba(${this.backgroundColor.replace('rgb(', '').replace(')', '')}, ${this.transparency})`
+                        };
+                        padding: ${1 * this.articleSpacing}px;
+                        margin: ${1 * this.articleSpacing}px 0;
+                    `
                 });
-                sumButton.set_child(sumIcon);
-                lineBox.add(sumButton);
-                this._signals.connect( sumButton, 'clicked', (...args) => this.onClickedSumButton(...args, item, itemBoxLayout, sumIcon));
-            }
 
-            if (this.enablecopy) {
-                const copyButton = new St.Button({ style: 'width: 24px;'});
-                const copyIcon = new St.Icon({
-                              icon_name: 'gtk-copy',
-                              icon_size: 20, 
-                              icon_type: St.IconType.SYMBOLIC
-                              });
-                copyButton.set_child(copyIcon);
-                lineBox.add(copyButton);
-                this._signals.connect( copyButton, 'clicked', (...args) => this.onClickedCopyButton(...args, item, itemBoxLayout));
-            }
-            
-            
-            const dateLabel = new St.Label({  text: ' ' + context._formatedDate(item.timestamp, false) + ' ', style: 'text-align: center;'   });
-            lineBox.add(dateLabel);
-            
-            let panelButton = new St.Button({});
-  
-            const itemLabel = new St.Label({
-                    text: item.title
-            });
-            itemLabel.hexpand = true;
-                
-
-            itemLabel.style = context.fontstyle;
-            
-            itemLabel.clutter_text.line_wrap = true;
-            itemLabel.clutter_text.line_wrap_mode = Pango.WrapMode.WORD;
-            itemLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
-            
-            let subItemBox = new St.BoxLayout({ 
-                vertical: true
-            });
-            if ( (counter % 2 ) == 0) {
-                subItemBox.style = "background-color: rgba(100,100,100,"+ this.alternateRowTransparency +");";
-            }
-
-            subItemBox.add(itemLabel);
-            
-            itemBoxLayout.add(subItemBox);
-
-            panelButton.set_child(itemBoxLayout);
-            
-            let toolTip2 = new Tooltips.Tooltip(panelButton, toolTipText );
-            toolTip2._tooltip.style = 'text-align: left;';
-            toolTip2._tooltip.clutter_text.set_use_markup(true);
-            toolTip2._tooltip.clutter_text.allocate_preferred_size(Clutter.AllocationFlags.NONE);
-            toolTip2._tooltip.queue_relayout();
-            
-            lineBox.add_actor( panelButton );
-            
-            
-            if (item.aiResponse.length > 0) {
-            
-                const aiLabel = new St.Label({  
-                    text:   item.aiResponse + '\n------------------------------------------------------', 
-                    style: 'text-align: left;'   
-                });
-                aiLabel.style = context.ai_fontstyle;
-                
-                aiLabel.clutter_text.line_wrap = true;
-                aiLabel.clutter_text.line_wrap_mode = Pango.WrapMode.WORD;
-                aiLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
-                 
-                itemBoxLayout.add(aiLabel);
-            }
-            
-            
-            context.tableContainer.add( lineBox );
-            
-        }
-        
-                
-    }
-
-    onTimerEvent() {
-    
-        this.timerInProgress = false;
-
-        if (this._updateInProgress) {
-            this.setUpdateTimer(this.delay);
-            return;
-        } else {
-
-            this._updateInProgress = true;
-
-            this.collectFeeds();	// ReShedule this...
-            
-            this.setUpdateTimer(this.delay);
-
-            this._updateInProgress = false;
-        }
-
-    }
-    
-    on_chatgptapikey_stored(source, result) {
-        Secret.password_store_finish(result);
-    }
-    
-    onChatGPAPIKeySave() {
-            let dialog = new PasswordDialog (
-                _("'%s' settings..\nPlease enter ChatGPT API key:").format(this._(this._meta.name)),
-                (password) => {
-                    Secret.password_store(this.STORE_SCHEMA, {}, Secret.COLLECTION_DEFAULT,
-                      "Yarr_ChatGPTApiKey", password, null, this.on_chatgptapikey_stored);
-                }, 
-                this
-            );
-            dialog.open();
-    }
-
-    summarizeUri(tool, item, lineBox, sumIcon) {
-    
-        sumIcon.set_icon_name('system-run');
-
-        const cmd = "/usr/bin/timeout -k 10 10 /usr/bin/"+tool+" -dump '" + item.link + "' || echo 'ERROR: TIMEOUT'"; 
-        
-        Util.spawn_async(
-            [
-                "/bin/bash", 
-                "-c", 
-                cmd
-            ],
-            Lang.bind(this, function (result) {
-                if (result.length > 16384) {
-                    result = result.substring(0,16384);
+                // Only add feed button if NOT hidden
+                if (!this.enableFeedButton) {
+                    const feedBtn = new St.Button({
+                        style: `
+                            background-color: ${item.labelColor}; 
+                            border-radius: 4px; 
+                            margin: 0 5px; 
+                            width: ${channelWidth}px;
+                        `
+                    });
+                    feedBtn.set_child(new St.Label({ text: item.channel }));
+                    feedBtn.connect('clicked', () => item.link && Util.spawnCommandLine(`xdg-open "${item.link}"`));
+                    lineBox.add(feedBtn);
                 }
-                
-                let usemodel = this.ai_model;
-                if (this.ai_use_standard_model=="optioncustom") {
-                    usemodel = this.ai_custom_model
-                }
-                const reqObj = { 
-                        "model": usemodel,
-                        "messages": [ 
-                            { 
-                                "role": "system", 
-                                "content": JSON.stringify(this.ai_systemprompt)
-                            },
-                            { 
-                                "role": "user", 
-                                "content": JSON.stringify(result)
-                            } 
-                        ]
-                };
 
-                //(method,url,headers,postParameters,callbackF, bodyMime)
-                this.httpRequest(
-                    'POST', 
-                    this.ai_url,
-                    [
-                        ['Authorization', 	'Bearer ' + Secret.password_lookup_sync(this.STORE_SCHEMA, {}, null )], 
-                        ['Content-type', 	'application/json']
-                    ], 
-                    JSON.stringify(reqObj),
-                    function (context, message, result) {
-                        global.log('RES: ', result);
-                        var resObj = JSON.parse(result);
-                        
-                        var aiResponse = "";
-                        if (resObj.hasOwnProperty("error")) {
-                            global.log('ERROR!')
-                            aiResponse = resObj.error.message;
+                // Only add timestamp if NOT hidden
+                if (!this.enableTimestamp) {
+                    const timeBox = new St.BoxLayout({
+                        vertical: false,
+                        style: 'width: 50px; margin: auto;'
+                    });
+
+                    const timeLabel = new St.Label({
+                        text: this._formatedDate(item.timestamp, false),
+                        y_align: Clutter.ActorAlign.CENTER,
+                        style: 'font-size: 0.8em; text-align: center; margin: auto;'
+                    });
+
+                    timeBox.add(timeLabel);
+                    lineBox.add(timeBox);
+                }
+
+                // Action buttons
+                const buttonBox = new St.BoxLayout({ style: 'spacing: 5px; padding: 0 5px;' });
+
+                if (this.ai_enablesummary && item.description) {
+                    const sumBtn = new St.Button({ style_class: 'yarr-button' });
+                    const sumIcon = new St.Icon({ icon_name: 'gtk-zoom-fit', icon_size: 16 });
+                    sumBtn.set_child(sumIcon);
+                    sumBtn.connect('clicked', () => this.onClickedSumButton(null, null, item, lineBox, sumIcon));
+                    buttonBox.add(sumBtn);
+                }
+
+                if (this.enablecopy) {
+                    const copyBtn = new St.Button({ style_class: 'yarr-button' });
+                    const copyIcon = new St.Icon({ icon_name: 'edit-copy-symbolic', icon_size: 16 });
+                    copyBtn.set_child(copyIcon);
+                    copyBtn.connect('clicked', () => this.onClickedCopyButton(null, null, item, lineBox));
+                    buttonBox.add(copyBtn);
+                }
+
+                // Add favorite button if enabled
+                if (this.enableFavoriteFeature) {
+                    const favoriteBtn = new St.Button({
+                        style_class: 'yarr-button',
+                        style: 'padding: 2px;'
+                    });
+
+                    // Set the appropriate icon based on favorite status
+                    const favoriteIcon = new St.Icon({
+                        icon_name: item.isFavorite ? 'starred' : 'non-starred',  // or 'star-new' for empty star
+                        icon_type: St.IconType.SYMBOLIC,
+                        icon_size: 16,
+                        style: item.isFavorite ? 'color: #ffd700;' : 'color: #888888;' // gold color if favorite
+                    });
+
+                    favoriteBtn.set_child(favoriteIcon);
+
+                    favoriteBtn.connect('clicked', () => {
+                        // Toggle favorite status
+                        item.isFavorite = !item.isFavorite;
+
+                        // Update database
+                        if (item.isFavorite) {
+                            if (this.favoritesDb.addFavorite(item)) {
+                                this.favoriteKeys.add(item.link);  // Use URL instead of key
+                            }
                         } else {
-                            if (resObj.hasOwnProperty("choices")) {
-                                aiResponse = resObj.choices[0].message.content;
-                            } else {
-                                aiResponse = "ERROR: " + usemodel + ": ";
-                                if (resObj.hasOwnProperty("detail")) {
-                                    aiResponse += resObj.detail;
-                                }
+                            if (this.favoritesDb.removeFavorite(item.link)) {  // Use URL instead of key
+                                this.favoriteKeys.delete(item.link);
                             }
                         }
-                        
-                        item.aiResponse = aiResponse;
-                        
-                        const aiLabel = new St.Label({  
-                            text:   aiResponse + '\n------------------------------------------------------', 
-                            style: 'text-align: left; width: 100px; display: flex; max-width: 200px;'   
-                        });
-                        aiLabel.style = context.ai_fontstyle;
-                        
-                        aiLabel.clutter_text.line_wrap = true;
-                        aiLabel.clutter_text.line_wrap_mode = Pango.WrapMode.WORD;
-                        aiLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
-                         
-                        lineBox.add(aiLabel);
-                        sumIcon.set_icon_name('gtk-zoom-fit');
-                        
 
-                    }, 
-                    'application/json'
-                ); 
-                    
-                
-                
-            })
-        );   
-        
+                        // Update icon
+                        favoriteIcon.set_icon_name(item.isFavorite ? 'starred' : 'non-starred');
+                        favoriteIcon.style = item.isFavorite ? 'color: #ffd700;' : 'color: #888888;';
+
+                        // Log status change
+                        global.log(`${item.isFavorite ? 'Added to' : 'Removed from'} favorites: ${item.title}`);
+                    });
+
+                    buttonBox.add(favoriteBtn);
+                }
+
+                // Title and content panel
+                let panelButton = new St.Button({
+                    style_class: 'yarr-panel-button',
+                    reactive: true,
+                    track_hover: true,
+                    x_expand: true,
+                    x_align: St.Align.START,
+                    style: `padding: ${3 * this.articleSpacing}px; border-radius: 4px;`
+                });
+
+                // Create subItemBox for title and AI response
+                let subItemBox = new St.BoxLayout({
+                    vertical: true,
+                    x_expand: true,
+                    x_align: St.Align.START,
+                    style: `spacing: ${2 * this.articleSpacing}px;`
+                });
+
+                // Title
+                const titleLabel = new St.Label({
+                    text: item.title,
+                    style: this.fontstyle,
+                    x_expand: true,
+                    x_align: St.Align.START
+                });
+                titleLabel.clutter_text.set_line_wrap(true);
+                titleLabel.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD);
+                titleLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+
+                subItemBox.add(titleLabel);
+
+                // AI response if exists
+                if (item.aiResponse) {
+                    const aiLabel = new St.Label({
+                        text: item.aiResponse,
+                        style: this.ai_fontstyle,
+                        x_expand: true,
+                        x_align: St.Align.START
+                    });
+                    aiLabel.clutter_text.set_line_wrap(true);
+                    aiLabel.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD);
+                    aiLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+
+                    subItemBox.add(aiLabel);
+                }
+
+                panelButton.set_child(subItemBox);
+
+                // Tooltip setup
+                if (item.description) {
+                    let tooltip = new Tooltips.Tooltip(panelButton);
+                    tooltip.set_markup(`<b>${item.title}</b>\n${item.pubDate}\n\n${this.HTMLPartToTextPart(item.description)}`);
+                    tooltip._tooltip.style = `
+                        text-align: left;
+                        max-width: 600px;
+                        padding: 12px;
+                        font-size: 1.1em;
+                        line-height: 1.4;
+                        background-color: rgba(32, 32, 32, 0.85);
+                        border: 1px solid rgba(255,255,255,0.1);
+                        border-radius: 4px;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+                    `;
+                    tooltip._tooltip.clutter_text.set_line_wrap(true);
+                    tooltip._tooltip.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);
+                    tooltip._tooltip.clutter_text.set_ellipsize(Pango.EllipsizeMode.NONE);
+                    tooltip._tooltip.set_x_align(St.Align.START);
+                    tooltip._tooltip.clutter_text.set_x_align(Clutter.ActorAlign.START);
+                }
+
+                // Add elements to lineBox
+                lineBox.add(buttonBox);
+                lineBox.add(panelButton);
+
+                this.dataBox.add(lineBox);
+            });
+
+        } catch (e) {
+            global.log('Error in displayItems:', e.toString());
+        }
     }
 
     formatTextWrap(text, maxLineLength) {
@@ -873,14 +1345,193 @@ class YarrDesklet extends Desklet.Desklet {
 
         // use functional reduce, instead of for loop
         return words.reduce((result, word) => {
-          if (lineLength + word.length >= maxLineLength) {
-            lineLength = word.length;
-            return result + `\n${word}`; // don't add spaces upfront
-          } else {
-            lineLength += word.length + (result ? 1 : 0);
-            return result ? result + ` ${word}` : `${word}`; // add space only when needed
-          }
+            if (lineLength + word.length >= maxLineLength) {
+                lineLength = word.length;
+                return result + `\n${word}`; // don't add spaces upfront
+            } else {
+                lineLength += word.length + (result ? 1 : 0);
+                return result ? result + ` ${word}` : `${word}`; // add space only when needed
+            }
         }, '');
+    }
+
+    // Resource monitoring functions
+    _updateResourceMetrics() {
+        const now = Date.now();
+
+        // Track update frequency
+        if (this._resourceUsage.lastUpdate) {
+            const updateInterval = now - this._resourceUsage.lastUpdate;
+            this._resourceUsage.updateIntervals =
+                this._resourceUsage.updateIntervals || [];
+            this._resourceUsage.updateIntervals.push(updateInterval);
+
+            // Keep only last 10 intervals
+            if (this._resourceUsage.updateIntervals.length > 10) {
+                this._resourceUsage.updateIntervals.shift();
+            }
+        }
+
+        this._resourceUsage.lastUpdate = now;
+        this._resourceUsage.updateCount++;
+
+        // Calculate adaptive refresh interval
+        if (this._resourceUsage.updateIntervals?.length > 5) {
+            const avgInterval = this._resourceUsage.updateIntervals.reduce((a, b) => a + b, 0) /
+                this._resourceUsage.updateIntervals.length;
+            this._adaptiveRefresh.currentDelay = Math.max(
+                this._adaptiveRefresh.minDelay,
+                Math.min(this._adaptiveRefresh.maxDelay, Math.floor(avgInterval / 1000))
+            );
+        }
+    }
+
+    // Error handling functions
+    _handleError(error, context = '') {
+        this._resourceUsage.errorCount++;
+
+        // Track error types
+        this._resourceUsage.errors = this._resourceUsage.errors || {};
+        const errorType = error.name || 'UnknownError';
+        this._resourceUsage.errors[errorType] =
+            (this._resourceUsage.errors[errorType] || 0) + 1;
+
+        global.log(`YarrDesklet Error [${context}]:`, error);
+
+        // Adaptive error handling
+        if (this._resourceUsage.errorCount > 5) {
+            this._adaptiveRefresh.currentDelay = Math.min(
+                this._adaptiveRefresh.currentDelay * 1.5,
+                this._adaptiveRefresh.maxDelay
+            );
+            this._resourceUsage.errorCount = 0;
+        }
+    }
+
+    processFeedResult(feed, result) {
+        try {
+            if (!result) return;
+            const resJSON = fromXML(result);
+            if (!resJSON?.rss?.channel?.item) return;
+
+            const items = Array.isArray(resJSON.rss.channel.item)
+                ? resJSON.rss.channel.item
+                : [resJSON.rss.channel.item];
+
+            items.forEach(item => {
+                try {
+                    // Skip if no link (we need it for SHA256)
+                    if (!item.link) return;
+
+                    const catStr = this.getCategoryString(item);
+                    const timestamp = new Date(item.pubDate);
+                    if (isNaN(timestamp.getTime())) return;
+
+                    // Calculate SHA256 of URL
+                    const id = this.favoritesDb._calculateSHA256(item.link);
+                    if (!id) return;
+
+                    // Generate map key using SHA256
+                    const key = `${id}`;
+
+                    // Check if this item already exists as a favorite
+                    const existingItem = Array.from(this.items.values())
+                        .find(existing =>
+                            existing.isFavorite &&
+                            this.favoritesDb._calculateSHA256(existing.link) === id
+                        );
+
+                    // Skip if item exists as a favorite
+                    if (existingItem) return;
+
+                    // Add new item
+                    this.items.set(key, {
+                        channel: feed.name,
+                        timestamp: timestamp,
+                        pubDate: item.pubDate,
+                        title: item.title || 'No Title',
+                        link: item.link,
+                        category: catStr,
+                        description: item.description || '',
+                        labelColor: feed.labelcolor || '#ffffff',
+                        aiResponse: '',
+                        isFavorite: this.favoriteKeys.has(item.link)
+                    });
+                } catch (e) {
+                    global.log('Error processing feed item:', e);
+                }
+            });
+        } catch (error) {
+            global.log('Error in processFeedResult:', error);
+            throw error;
+        }
+    }
+
+    on_chatgptapikey_stored(source, result) {
+        Secret.password_store_finish(result);
+    }
+
+    onChatGPAPIKeySave() {
+        let dialog = new PasswordDialog(
+            _("'%s' settings..\nPlease enter ChatGPT API key:").format(this._(this._meta.name)),
+            (password) => {
+                Secret.password_store(
+                    this.STORE_SCHEMA,
+                    {},
+                    Secret.COLLECTION_DEFAULT,
+                    "Yarr_ChatGPTApiKey",
+                    password,
+                    null,
+                    this.on_chatgptapikey_stored
+                );
+            },
+            this
+        );
+        dialog.open();
+    }
+
+    // Add new method to load favorite articles
+    async loadFavoriteArticles() {
+        try {
+            const sql = `
+                SELECT * FROM favorites 
+                ORDER BY timestamp DESC
+            `;
+
+            const [success, stdout, stderr] = GLib.spawn_command_line_sync(
+                `sqlite3 "${this.favoritesDb.dbFile}" "${sql}" -json`
+            );
+
+            if (!success) {
+                global.log('Error loading favorites:', stderr.toString());
+                return;
+            }
+
+            const favorites = JSON.parse(stdout.toString() || '[]');
+            favorites.forEach(item => {
+                // Calculate SHA256 of URL for consistent key
+                const id = this.favoritesDb._calculateSHA256(item.link);
+                if (!id) return;
+
+                // Use SHA256 as key
+                const key = `${id}`;
+
+                this.items.set(key, {
+                    channel: item.channel,
+                    timestamp: new Date(parseInt(item.timestamp)),
+                    pubDate: item.pubDate,
+                    title: item.title,
+                    link: item.link,
+                    category: item.category,
+                    description: item.description,
+                    labelColor: item.labelColor,
+                    aiResponse: item.aiResponse,
+                    isFavorite: true
+                });
+            });
+        } catch (e) {
+            global.log('Error in loadFavoriteArticles:', e);
+        }
     }
 }
 
@@ -893,60 +1544,194 @@ function main(metadata, desklet_id) {
 //--------------------------------------------
 
 class PasswordDialog extends ModalDialog.ModalDialog {
+    constructor(label, callback, parent) {
+        super();  // This must be first!
+        this.callback = callback;  // Store callback before using
 
-    constructor(label, callback, parent){
-        super();
-        
-        this.password = Secret.password_lookup_sync(parent.STORE_SCHEMA, {}, null );
+        this.password = Secret.password_lookup_sync(parent.STORE_SCHEMA, {}, null);
 
+        this.contentLayout.set_style('width: auto; max-width: 500px;'); // Match dialog width
         this.contentLayout.add(new St.Label({ text: label }));
-        this.callback = callback;
 
         this.passwordBox = new St.BoxLayout({ vertical: false });
-
-        this.entry = new St.Entry({ style: 'background: green; color:yellow;'});
+        this.entry = new St.Entry({ style: 'background: green; color:yellow; max-width: 400px;' });
         this.entry.clutter_text.set_password_char('\u25cf');
         this.entry.clutter_text.set_text(this.password);
-
         this.passwordBox.add(this.entry);
-
         this.contentLayout.add(this.passwordBox);
-
-        this.setInitialKeyFocus( this.entry.clutter_text );
+        this.setInitialKeyFocus(this.entry.clutter_text);
 
         this.setButtons([
-          {
-              label: "Save", 
-              action: ()  => {
-                  const pwd = this.entry.get_text();
-                  this.callback( pwd );
-                  this.destroy();
-              }, 
-              key: Clutter.KEY_Return, 
-              focused: false
-          },
-          {
-              label: "Show/Hide password",
-              action: ()  => {
-                
-                 if (this.entry.clutter_text.get_password_char()) { 
-                     this.entry.clutter_text.set_password_char('');
-                 } else {
-                     this.entry.clutter_text.set_password_char('\u25cf');
-                 }
-              }, 
-              focused: false
-          },
-          {
-              label: "Cancel", 
-              action: ()  => {
-                  this.destroy();
-              },  
-              key: null, 
-              focused: false
-          }
+            {
+                label: "Save",
+                action: () => {
+                    const pwd = this.entry.get_text();
+                    this.callback(pwd);
+                    this.destroy();
+                },
+                key: Clutter.KEY_Return,
+                focused: false
+            },
+            {
+                label: "Show/Hide password",
+                action: () => {
+                    if (this.entry.clutter_text.get_password_char()) {
+                        this.entry.clutter_text.set_password_char('');
+                    } else {
+                        this.entry.clutter_text.set_password_char('\u25cf');
+                    }
+                },
+                focused: false
+            },
+            {
+                label: "Cancel",
+                action: () => {
+                    this.destroy();
+                },
+                key: null,
+                focused: false
+            }
         ]);
+    }
+}
 
+// Add new class for database management
+class FavoritesDB {
+    constructor() {
+        this.dbFile = GLib.build_filenamev([GLib.get_user_data_dir(), 'yarr_favorites.db']);
+        this.initDatabase();
+    }
+
+    initDatabase() {
+        try {
+            // Create database with all fields
+            const sql = `
+                CREATE TABLE IF NOT EXISTS favorites (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    link TEXT,
+                    channel TEXT,
+                    category TEXT,
+                    description TEXT,
+                    aiResponse TEXT,
+                    labelColor TEXT,
+                    timestamp INTEGER,
+                    pubDate TEXT,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+                )
+            `;
+
+            const [success, stdout, stderr] = GLib.spawn_command_line_sync(
+                `sqlite3 "${this.dbFile}" "${sql}"`
+            );
+
+            if (!success) {
+                global.log('Error initializing database:', stderr.toString());
+            }
+        } catch (e) {
+            global.log('Error in initDatabase:', e);
+        }
+    }
+
+    // Helper function to calculate SHA256
+    _calculateSHA256(str) {
+        try {
+            const bytes = new TextEncoder().encode(str);
+            const checksum = GLib.Checksum.new(GLib.ChecksumType.SHA256);
+            checksum.update(bytes);
+            return checksum.get_string();
+        } catch (e) {
+            global.log('Error calculating SHA256:', e);
+            return null;
+        }
+    }
+
+    addFavorite(item) {
+        try {
+            // Calculate SHA256 of URL as primary key
+            const id = this._calculateSHA256(item.link || '');
+            if (!id) return false;
+
+            const sql = `
+                INSERT OR REPLACE INTO favorites (
+                    id, title, link, channel, category, description, 
+                    aiResponse, labelColor, timestamp, pubDate, updated_at
+                ) VALUES (
+                    '${this._escapeString(id)}',
+                    '${this._escapeString(item.title)}',
+                    '${this._escapeString(item.link)}',
+                    '${this._escapeString(item.channel)}',
+                    '${this._escapeString(item.category)}',
+                    '${this._escapeString(item.description)}',
+                    '${this._escapeString(item.aiResponse)}',
+                    '${this._escapeString(item.labelColor)}',
+                    ${item.timestamp.getTime()},
+                    '${this._escapeString(item.pubDate)}',
+                    strftime('%s', 'now')
+                )
+            `;
+
+            const [success, stdout, stderr] = GLib.spawn_command_line_sync(
+                `sqlite3 "${this.dbFile}" "${sql}"`
+            );
+
+            if (!success) {
+                global.log('Error adding favorite:', stderr.toString());
+            }
+            return success;
+        } catch (e) {
+            global.log('Error in addFavorite:', e);
+            return false;
+        }
+    }
+
+    removeFavorite(url) {
+        try {
+            const id = this._calculateSHA256(url);
+            if (!id) return false;
+
+            const sql = `DELETE FROM favorites WHERE id = '${this._escapeString(id)}'`;
+
+            const [success, stdout, stderr] = GLib.spawn_command_line_sync(
+                `sqlite3 "${this.dbFile}" "${sql}"`
+            );
+
+            if (!success) {
+                global.log('Error removing favorite:', stderr.toString());
+            }
+            return success;
+        } catch (e) {
+            global.log('Error in removeFavorite:', e);
+            return false;
+        }
+    }
+
+    getFavorites() {
+        try {
+            // Get all data from favorites
+            const sql = "SELECT link FROM favorites";
+
+            const [success, stdout, stderr] = GLib.spawn_command_line_sync(
+                `sqlite3 "${this.dbFile}" "${sql}"`
+            );
+
+            if (!success) {
+                global.log('Error getting favorites:', stderr.toString());
+                return new Set();
+            }
+
+            const favorites = stdout.toString().split('\n').filter(Boolean);
+            return new Set(favorites);
+        } catch (e) {
+            global.log('Error in getFavorites:', e);
+            return new Set();
+        }
+    }
+
+    _escapeString(str) {
+        if (!str) return '';
+        return str.replace(/'/g, "''");
     }
 }
 
